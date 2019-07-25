@@ -1,0 +1,144 @@
+from backbone.model_irse import IR_50
+import numpy as np
+from tqdm import tqdm
+from util.generate_attacks import pgd_attack
+import torch.nn as nn
+from config import configurations
+from PIL import Image
+import torch
+
+# gallery = "/home/zengyuyuan/Exp/FaceReco/data/deepcamp_data/gallery.txt"
+# query = "/home/zengyuyuan/Exp/FaceReco/data/deepcamp_data/query.txt"
+
+gallery = "/mnt/nfs/team38/deecamp_face/gallery.txt"
+query = "/mnt/nfs/team38/deecamp_face/query.txt"
+
+def reader(file):
+    with open(file) as f:
+        lines = f.readlines()
+    data = [i.strip().split('\t')[0] for i in lines]
+    labels = [i.strip().split('\t')[1] for i in lines]
+    return data, labels
+
+def img2tensor(img):
+    img = np.array(img)
+    img = img.swapaxes(1, 2).swapaxes(0, 1)
+    img = np.reshape(img, [1, 3, 112, 112])
+    img = np.array(img, dtype = np.float32)
+    img = (img - 127.5) / 128.0
+    img = torch.from_numpy(img)
+    return img
+
+def l2_norm(input, axis = 1):
+    norm = torch.norm(input, 2, axis, True)
+    output = torch.div(input, norm)
+    return output
+
+
+def preprocess_image(filenames):
+    img_list = []
+    for filename in tqdm(filenames):
+        img_align = Image.open(filename)
+        img_tensor = img2tensor(img_align)
+        img_list.append(img_tensor)
+    return img_list
+
+def get_feature(model, filename):
+    img_align = Image.open(filename)
+    feat = l2_norm(model(img2tensor(img_align).cuda()))
+    return feat.detach().cpu().numpy(), True
+
+
+def extract_raw_feature(model,query_imgs,batch_size):
+    eval_size = len(query_imgs)
+    features = []
+    idx = 0
+    for itr in tqdm(range(int(eval_size / batch_size))):
+        # print(query_imgs[idx:idx + batch_size])
+        batch = torch.cat(query_imgs[idx:idx + batch_size],0)
+        # print(batch.shape)
+        imgs = batch.cuda()
+        feat = l2_norm(model(imgs).cpu().data)
+        features.append(feat)
+        idx = idx+batch_size
+    if idx < eval_size:
+        batch = torch.cat(query_imgs[idx:eval_size],dim=0)
+        imgs = batch.cuda()
+        feat = l2_norm(model(imgs).cpu().data)
+        features.append(feat)
+    features = torch.cat(features,dim=0)
+    return features
+
+
+def extract_attack_feature(model,query_imgs,adversary,batch_size):
+    eval_size = len(query_imgs)
+    features = []
+    idx = 0
+    for itr in tqdm(range(int(eval_size / batch_size))):
+        # print(query_imgs[idx:idx + batch_size])
+        batch = torch.cat(query_imgs[idx:idx + batch_size],0)
+        # print(batch.shape)
+        imgs_attack = adversary.perturb(batch.cuda())
+        feat = l2_norm(model(imgs_attack).cpu().data)
+        features.append(feat)
+        idx = idx+batch_size
+    if idx < eval_size:
+        batch = torch.cat(query_imgs[idx:eval_size],dim=0)
+        imgs_attack = adversary.perturb(batch.cuda())
+        feat = l2_norm(model(imgs_attack).cpu().data)
+        features.append(feat)
+    features = torch.cat(features,dim=0)
+    return features
+
+
+def evaluation(gallery_features,query_features):
+    gallery_features = torch.Tensor(gallery_features)
+    print(gallery_features.shape)
+    all_dists = torch.matmul(query_features,torch.transpose(gallery_features,0,1))
+    print(all_dists.shape)
+
+    max_indices = all_dists.argmax(1)
+    right = 0
+    wrong = 0
+    for j in range(len(query_filenames)):
+        print("query #{}, dist: {:.4}, true label: {}, predicted label: {}".format(j, all_dists[j][max_indices[j]],
+                                                                                   query_labels[j],
+                                                                                   gallery_labels[max_indices[j]]))
+        if query_labels[j] == gallery_labels[max_indices[j]]:
+            right += 1
+        else:
+            wrong += 1
+    accu = right / (right + wrong)
+    return accu
+
+
+
+if __name__ == "__main__":
+    BATCH_SIZE = 64
+
+    model = IR_50([112,112])
+    model.load_state_dict(torch.load('backbone_ir50_ms1m_epoch120.pth',map_location='cpu'))
+    model.cuda()
+    model.eval()
+
+    query_filenames, query_labels = reader(query)
+    gallery_filenames, gallery_labels = reader(gallery)
+
+    print('Extracting gallery feature...')
+    # gallery_features = extract(model, gallery_filenames)
+    gallery_imgs = preprocess_image(gallery_filenames)
+    gallery_features = extract_raw_feature(model, gallery_imgs,BATCH_SIZE)
+    print(gallery_features.shape)
+
+    print('Preprocessing query feature...')
+    query_imgs = preprocess_image(query_filenames)
+    # define attack
+    print('Extracting query feature...')
+    adversary = pgd_attack(model, loss_fn=nn.CrossEntropyLoss(reduction="sum"),
+                           eps=0.03,nb_iter=20,eps_iter=0.01,rand_init=True,targeted=False)
+    # query_features = extract_raw_feature(model, query_imgs,BATCH_SIZE)
+    query_features = extract_attack_feature(model, query_imgs,adversary,BATCH_SIZE)
+    print(query_features.shape)
+
+    accu = evaluation(gallery_features,query_features)
+    print("Accuracy: {:.6}".format(accu))
