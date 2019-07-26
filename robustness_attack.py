@@ -1,4 +1,4 @@
-
+from PIL import Image
 import torch
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
@@ -15,11 +15,14 @@ IMG_DIR="/home/zhangao/datasets/lfwtestAligned/"
 ID_DIR="/home/zhangao/datasets/lfwidAligned/"
 MULTIGPU=False
 
-LOAD_EMBEDDINGS="id_embeddings.pkl"
+
+LOAD_EMBEDDINGS="None"
+
 PIN_MEMORY=False
 NUM_WORKERS=0
 BATCH_SIZE=8
 EMBEDDING_SIZE = 512
+SAVE = False
 
 device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
 
@@ -85,7 +88,6 @@ if  not LOAD_EMBEDDINGS==None:
     fr = open(LOAD_EMBEDDINGS,'rb')
     id_embeddings,id_name_to_index,id_index_to_name = pickle.load(fr)
 
-    #carray,id_name_to_index,id_index_to_name = np.load(LOAD_EMBEDDINGS)
 else:
     carray,id_name_to_index,id_index_to_name = utils.read_identities(ID_DIR)
     
@@ -116,8 +118,12 @@ for i, (img, label) in tqdm(enumerate(loader)):
     for j,index in enumerate(_pred):
         pred[j] = dataset.class_to_idx[id_index_to_name[index]]
     clean_acc += np.sum(pred==label.numpy())
-
+    
     adv= attack(model, img, label,id_embeddings, eps=eps, attack_type= 'pgd', iters= 10,device=device, target_index=batch_target_index)
+    if SAVE:
+        for j,arr in enumerate(adv.clone().detach().cpu().numpy()): 
+            img = Image.fromarray((255*arr.transpose(1,2,0)).astype(np.uint8))
+            img.save("adv_img/%s-%s.jpg"%(dataset.classes[label.numpy()[j]],id_index_to_name[batch_target_index[j]]))
     features_adv = extract_features.l2_normlize( model(utils.normalize(adv.clone().detach())))
     _pred_adv = features_adv.mm(id_embeddings_t).argmax(dim=-1).detach().cpu().numpy()
     pred_adv= np.zeros(BATCH_SIZE,dtype=np.int)

@@ -25,7 +25,7 @@ def generate_id_embeddings(multi_gpu, device, embedding_size, batch_size, backbo
     with torch.no_grad():
         while idx + batch_size <= len(carray):
             
-            batch = torch.tensor(carray[idx:idx + batch_size][:, [2, 1, 0], :, :])
+            batch = torch.tensor(carray[idx:idx + batch_size])
 
             embeddings[idx:idx + batch_size] = l2_normlize(backbone(batch.to(device))).cpu()
             idx += batch_size
