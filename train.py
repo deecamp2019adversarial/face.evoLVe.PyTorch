@@ -14,6 +14,21 @@ from util.utils import make_weights_for_balanced_classes, get_val_data, separate
 from tensorboardX import SummaryWriter
 from tqdm import tqdm
 import os
+from util.generate_attacks import pgd_attack
+import random
+
+
+class HEAD_SOFTMAX_LOSS(nn.Module):
+    def __init__(self,head_loss,softmax_loss):
+        super(HEAD_SOFTMAX_LOSS, self).__init__()
+        self.HEAD = head_loss
+        self.LOSS = softmax_loss
+
+    def forward(self,input,labels):
+        outputs = self.HEAD(input, labels)
+        loss = self.LOSS(outputs, labels)
+        return loss
+
 
 
 if __name__ == '__main__':
@@ -67,7 +82,8 @@ if __name__ == '__main__':
                              std = RGB_STD),
     ])
 
-    dataset_train = datasets.ImageFolder(os.path.join(DATA_ROOT, 'imgs'), train_transform)
+    # dataset_train = datasets.ImageFolder(os.path.join(DATA_ROOT, 'imgs'), train_transform)
+    dataset_train = datasets.ImageFolder(DATA_ROOT, train_transform)
 
     # create a weighted random sampler to process imbalanced data
     weights = make_weights_for_balanced_classes(dataset_train.imgs, len(dataset_train.classes))
@@ -82,7 +98,7 @@ if __name__ == '__main__':
     NUM_CLASS = len(train_loader.dataset.classes)
     print("Number of Training Classes: {}".format(NUM_CLASS))
 
-    lfw, cfp_ff, cfp_fp, agedb, calfw, cplfw, vgg2_fp, lfw_issame, cfp_ff_issame, cfp_fp_issame, agedb_issame, calfw_issame, cplfw_issame, vgg2_fp_issame = get_val_data(DATA_ROOT)
+    # lfw, cfp_ff, cfp_fp, agedb, calfw, cplfw, vgg2_fp, lfw_issame, cfp_ff_issame, cfp_fp_issame, agedb_issame, calfw_issame, cplfw_issame, vgg2_fp_issame = get_val_data(DATA_ROOT)
 
 
     #======= model & loss & optimizer =======#
@@ -132,13 +148,22 @@ if __name__ == '__main__':
     print("=" * 60)
 
     # optionally resume from a checkpoint
-    if BACKBONE_RESUME_ROOT and HEAD_RESUME_ROOT:
+    # if BACKBONE_RESUME_ROOT and HEAD_RESUME_ROOT:
+    #     print("=" * 60)
+    #     if os.path.isfile(BACKBONE_RESUME_ROOT) and os.path.isfile(HEAD_RESUME_ROOT):
+    #         print("Loading Backbone Checkpoint '{}'".format(BACKBONE_RESUME_ROOT))
+    #         BACKBONE.load_state_dict(torch.load(BACKBONE_RESUME_ROOT))
+    #         print("Loading Head Checkpoint '{}'".format(HEAD_RESUME_ROOT))
+    #         HEAD.load_state_dict(torch.load(HEAD_RESUME_ROOT))
+    #     else:
+    #         print("No Checkpoint Found at '{}' and '{}'. Please Have a Check or Continue to Train from Scratch".format(BACKBONE_RESUME_ROOT, HEAD_RESUME_ROOT))
+    #     print("=" * 60)
+
+    if BACKBONE_RESUME_ROOT:
         print("=" * 60)
-        if os.path.isfile(BACKBONE_RESUME_ROOT) and os.path.isfile(HEAD_RESUME_ROOT):
+        if os.path.isfile(BACKBONE_RESUME_ROOT):
             print("Loading Backbone Checkpoint '{}'".format(BACKBONE_RESUME_ROOT))
             BACKBONE.load_state_dict(torch.load(BACKBONE_RESUME_ROOT))
-            print("Loading Head Checkpoint '{}'".format(HEAD_RESUME_ROOT))
-            HEAD.load_state_dict(torch.load(HEAD_RESUME_ROOT))
         else:
             print("No Checkpoint Found at '{}' and '{}'. Please Have a Check or Continue to Train from Scratch".format(BACKBONE_RESUME_ROOT, HEAD_RESUME_ROOT))
         print("=" * 60)
@@ -153,7 +178,7 @@ if __name__ == '__main__':
 
 
     #======= train & validation & save checkpoint =======#
-    DISP_FREQ = len(train_loader) // 100 # frequency to display training loss & acc
+    DISP_FREQ = len(train_loader) // 10 # frequency to display training loss & acc
 
     NUM_EPOCH_WARM_UP = NUM_EPOCH // 25  # use the first 1/25 epochs to warm up
     NUM_BATCH_WARM_UP = len(train_loader) * NUM_EPOCH_WARM_UP  # use the first 1/25 epochs to warm up
@@ -175,6 +200,10 @@ if __name__ == '__main__':
         top1 = AverageMeter()
         top5 = AverageMeter()
 
+        head_softmax_loss = HEAD_SOFTMAX_LOSS(HEAD,LOSS)
+        adversary = pgd_attack(BACKBONE, loss_fn=head_softmax_loss,
+                               eps=0.03, nb_iter=20, eps_iter=0.01, rand_init=True, targeted=False)
+
         for inputs, labels in tqdm(iter(train_loader)):
 
             if (epoch + 1 <= NUM_EPOCH_WARM_UP) and (batch + 1 <= NUM_BATCH_WARM_UP): # adjust LR for each training batch during warm up
@@ -183,6 +212,14 @@ if __name__ == '__main__':
             # compute output
             inputs = inputs.to(DEVICE)
             labels = labels.to(DEVICE).long()
+
+            #adversarial training
+            random_index = random.sample(range(BATCH_SIZE),int(BATCH_SIZE/2))
+            inputs_sampels = inputs[random_index]
+            labels_samples = labels[random_index]
+            adversary_input = adversary.perturb(inputs_sampels,labels_samples)
+            inputs[random_index] = adversary_input
+
             features = BACKBONE(inputs)
             outputs = HEAD(features, labels)
             loss = LOSS(outputs, labels)
@@ -197,6 +234,8 @@ if __name__ == '__main__':
             OPTIMIZER.zero_grad()
             loss.backward()
             OPTIMIZER.step()
+
+
             
             # dispaly training loss & acc every DISP_FREQ
             if ((batch + 1) % DISP_FREQ == 0) and batch != 0:
@@ -226,25 +265,27 @@ if __name__ == '__main__':
         # perform validation & save checkpoints per epoch
         # validation statistics per epoch (buffer for visualization)
         print("=" * 60)
-        print("Perform Evaluation on LFW, CFP_FF, CFP_FP, AgeDB, CALFW, CPLFW and VGG2_FP, and Save Checkpoints...")
-        accuracy_lfw, best_threshold_lfw, roc_curve_lfw = perform_val(MULTI_GPU, DEVICE, EMBEDDING_SIZE, BATCH_SIZE, BACKBONE, lfw, lfw_issame)
-        buffer_val(writer, "LFW", accuracy_lfw, best_threshold_lfw, roc_curve_lfw, epoch + 1)
-        accuracy_cfp_ff, best_threshold_cfp_ff, roc_curve_cfp_ff = perform_val(MULTI_GPU, DEVICE, EMBEDDING_SIZE, BATCH_SIZE, BACKBONE, cfp_ff, cfp_ff_issame)
-        buffer_val(writer, "CFP_FF", accuracy_cfp_ff, best_threshold_cfp_ff, roc_curve_cfp_ff, epoch + 1)
-        accuracy_cfp_fp, best_threshold_cfp_fp, roc_curve_cfp_fp = perform_val(MULTI_GPU, DEVICE, EMBEDDING_SIZE, BATCH_SIZE, BACKBONE, cfp_fp, cfp_fp_issame)
-        buffer_val(writer, "CFP_FP", accuracy_cfp_fp, best_threshold_cfp_fp, roc_curve_cfp_fp, epoch + 1)
-        accuracy_agedb, best_threshold_agedb, roc_curve_agedb = perform_val(MULTI_GPU, DEVICE, EMBEDDING_SIZE, BATCH_SIZE, BACKBONE, agedb, agedb_issame)
-        buffer_val(writer, "AgeDB", accuracy_agedb, best_threshold_agedb, roc_curve_agedb, epoch + 1)
-        accuracy_calfw, best_threshold_calfw, roc_curve_calfw = perform_val(MULTI_GPU, DEVICE, EMBEDDING_SIZE, BATCH_SIZE, BACKBONE, calfw, calfw_issame)
-        buffer_val(writer, "CALFW", accuracy_calfw, best_threshold_calfw, roc_curve_calfw, epoch + 1)
-        accuracy_cplfw, best_threshold_cplfw, roc_curve_cplfw = perform_val(MULTI_GPU, DEVICE, EMBEDDING_SIZE, BATCH_SIZE, BACKBONE, cplfw, cplfw_issame)
-        buffer_val(writer, "CPLFW", accuracy_cplfw, best_threshold_cplfw, roc_curve_cplfw, epoch + 1)
-        accuracy_vgg2_fp, best_threshold_vgg2_fp, roc_curve_vgg2_fp = perform_val(MULTI_GPU, DEVICE, EMBEDDING_SIZE, BATCH_SIZE, BACKBONE, vgg2_fp, vgg2_fp_issame)
-        buffer_val(writer, "VGGFace2_FP", accuracy_vgg2_fp, best_threshold_vgg2_fp, roc_curve_vgg2_fp, epoch + 1)
-        print("Epoch {}/{}, Evaluation: LFW Acc: {}, CFP_FF Acc: {}, CFP_FP Acc: {}, AgeDB Acc: {}, CALFW Acc: {}, CPLFW Acc: {}, VGG2_FP Acc: {}".format(epoch + 1, NUM_EPOCH, accuracy_lfw, accuracy_cfp_ff, accuracy_cfp_fp, accuracy_agedb, accuracy_calfw, accuracy_cplfw, accuracy_vgg2_fp))
-        print("=" * 60)
+        # print("Perform Evaluation on LFW, CFP_FF, CFP_FP, AgeDB, CALFW, CPLFW and VGG2_FP, and Save Checkpoints...")
+        # accuracy_lfw, best_threshold_lfw, roc_curve_lfw = perform_val(MULTI_GPU, DEVICE, EMBEDDING_SIZE, BATCH_SIZE, BACKBONE, lfw, lfw_issame)
+        # buffer_val(writer, "LFW", accuracy_lfw, best_threshold_lfw, roc_curve_lfw, epoch + 1)
+        # accuracy_cfp_ff, best_threshold_cfp_ff, roc_curve_cfp_ff = perform_val(MULTI_GPU, DEVICE, EMBEDDING_SIZE, BATCH_SIZE, BACKBONE, cfp_ff, cfp_ff_issame)
+        # buffer_val(writer, "CFP_FF", accuracy_cfp_ff, best_threshold_cfp_ff, roc_curve_cfp_ff, epoch + 1)
+        # accuracy_cfp_fp, best_threshold_cfp_fp, roc_curve_cfp_fp = perform_val(MULTI_GPU, DEVICE, EMBEDDING_SIZE, BATCH_SIZE, BACKBONE, cfp_fp, cfp_fp_issame)
+        # buffer_val(writer, "CFP_FP", accuracy_cfp_fp, best_threshold_cfp_fp, roc_curve_cfp_fp, epoch + 1)
+        # accuracy_agedb, best_threshold_agedb, roc_curve_agedb = perform_val(MULTI_GPU, DEVICE, EMBEDDING_SIZE, BATCH_SIZE, BACKBONE, agedb, agedb_issame)
+        # buffer_val(writer, "AgeDB", accuracy_agedb, best_threshold_agedb, roc_curve_agedb, epoch + 1)
+        # accuracy_calfw, best_threshold_calfw, roc_curve_calfw = perform_val(MULTI_GPU, DEVICE, EMBEDDING_SIZE, BATCH_SIZE, BACKBONE, calfw, calfw_issame)
+        # buffer_val(writer, "CALFW", accuracy_calfw, best_threshold_calfw, roc_curve_calfw, epoch + 1)
+        # accuracy_cplfw, best_threshold_cplfw, roc_curve_cplfw = perform_val(MULTI_GPU, DEVICE, EMBEDDING_SIZE, BATCH_SIZE, BACKBONE, cplfw, cplfw_issame)
+        # buffer_val(writer, "CPLFW", accuracy_cplfw, best_threshold_cplfw, roc_curve_cplfw, epoch + 1)
+        # accuracy_vgg2_fp, best_threshold_vgg2_fp, roc_curve_vgg2_fp = perform_val(MULTI_GPU, DEVICE, EMBEDDING_SIZE, BATCH_SIZE, BACKBONE, vgg2_fp, vgg2_fp_issame)
+        # buffer_val(writer, "VGGFace2_FP", accuracy_vgg2_fp, best_threshold_vgg2_fp, roc_curve_vgg2_fp, epoch + 1)
+        # print("Epoch {}/{}, Evaluation: LFW Acc: {}, CFP_FF Acc: {}, CFP_FP Acc: {}, AgeDB Acc: {}, CALFW Acc: {}, CPLFW Acc: {}, VGG2_FP Acc: {}".format(epoch + 1, NUM_EPOCH, accuracy_lfw, accuracy_cfp_ff, accuracy_cfp_fp, accuracy_agedb, accuracy_calfw, accuracy_cplfw, accuracy_vgg2_fp))
+        # print("=" * 60)
 
         # save checkpoints per epoch
+        if os.path.isdir(MODEL_ROOT) == False:
+            os.mkdir(MODEL_ROOT)
         if MULTI_GPU:
             torch.save(BACKBONE.module.state_dict(), os.path.join(MODEL_ROOT, "Backbone_{}_Epoch_{}_Batch_{}_Time_{}_checkpoint.pth".format(BACKBONE_NAME, epoch + 1, batch, get_time())))
             torch.save(HEAD.state_dict(), os.path.join(MODEL_ROOT, "Head_{}_Epoch_{}_Batch_{}_Time_{}_checkpoint.pth".format(HEAD_NAME, epoch + 1, batch, get_time())))
